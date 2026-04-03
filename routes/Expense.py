@@ -8,7 +8,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 from db.database import get_db
 from utils.helper import verify_user_token
-from models import Group, Expense, ExpenseUser
+from models import Group, Expense, ExpenseUser, User
 from typing import List
 
 
@@ -17,6 +17,7 @@ router = APIRouter(dependencies=[Depends(verify_user_token)])
 
 class CreateGroup(BaseModel):
     name: str
+    user_ids: List[int]
 
 
 class ParticipantInput(BaseModel):
@@ -45,7 +46,7 @@ def create_group(
     db: Session = Depends(get_db),
 ):
     try:
-        new_group = Group(name=data.name)
+        new_group = Group(name=data.name, user_ids=data.user_ids)
 
         db.add(new_group)
         db.commit()
@@ -60,14 +61,43 @@ def create_group(
         )
 
 
-@router.post("/create_expense")
-def create_expense(data: ExpenseCreate, db: Session = Depends(get_db)):
+@router.get("/get_groups")
+def get_groups(
+    current_user_email = Depends(verify_user_token),
+    db: Session = Depends(get_db),
+):
     try:
+
+        current_user = db.query(User).filter(User.email == current_user_email).first()
+
+        all_groups = db.query(Group).all()
+
+        my_groups = []
+
+        for group in list(all_groups):
+            if (current_user.id in group.user_ids):
+                my_groups.append(group)
+
+        return my_groups
+ 
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+
+@router.post("/create_expense")
+def create_expense(data: ExpenseCreate, current_user_email = Depends(verify_user_token), db: Session = Depends(get_db)):
+    try:
+        current_user = db.query(User).filter(User.email == current_user_email).first()
+
         # 1. Initialize the main Expense
         new_expense = Expense(
             description=data.description,
             total_amount=data.total_amount,
             group_id=data.group_id,
+            created_by = current_user.id
         )
         db.add(new_expense)
         db.flush()  # Gets the new_expense.id

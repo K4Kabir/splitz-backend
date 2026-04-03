@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Boolean, ARRAY
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from db.database import Base
@@ -20,7 +20,7 @@ class Group(Base):
     __tablename__ = "groups"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
-
+    user_ids = Column(ARRAY(Integer), nullable=True)
     expenses = relationship("Expense", back_populates="group")
 
 
@@ -31,7 +31,7 @@ class Expense(Base):
     total_amount = Column(Float, nullable=False)
     group_id = Column(Integer, ForeignKey("groups.id"))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
+    created_by = Column(Integer, ForeignKey("users.id"))
     group = relationship("Group", back_populates="expenses")
     # This links to the bridge table
     user_associations = relationship(
