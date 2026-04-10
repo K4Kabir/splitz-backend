@@ -22,4 +22,4 @@ app.add_middleware(
 
 
 app.include_router(user_router, prefix="/user", tags=["User Interface"])
-app.include_router(expense_router, prefix="/expense", tags=["Messages Interface"])
+app.include_router(expense_router, prefix="/expense", tags=["Expense Interface"])

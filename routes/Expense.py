@@ -6,6 +6,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from db.database import get_db
 from utils.helper import verify_user_token
 from models import Group, Expense, ExpenseUser, User
@@ -15,9 +16,25 @@ from typing import List
 router = APIRouter(dependencies=[Depends(verify_user_token)])
 
 
+def serialize_user(user: User):
+    if not user:
+        return None
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "is_active": user.is_active,
+    }
+
+
 class CreateGroup(BaseModel):
     name: str
     user_ids: List[int]
+
+
+class UpdateGroup(BaseModel):
+    name: str = None
+    user_ids: List[int] = None
 
 
 class ParticipantInput(BaseModel):
@@ -38,6 +55,37 @@ class ExpenseCreate(BaseModel):
         if sum(p.paid_amount for p in v) != total_amt:
             raise ValueError("Sum of paid_amounts must equal total_amount")
         return v
+
+
+@router.get("/me")
+def my_profile(
+    current_user_email=Depends(verify_user_token),
+    db: Session = Depends(get_db),
+):
+    try:
+        me = db.query(User).filter(User.email == current_user_email).first()
+
+        return me
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+@router.get("/get_all_users")
+def get_all_users(
+    db: Session = Depends(get_db),
+):
+    try:
+        all_users = db.query(User).all()
+
+        return [serialize_user(user) for user in all_users]
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
 
 
 @router.post("/create_group")
@@ -63,32 +111,194 @@ def create_group(
 
 @router.get("/get_groups")
 def get_groups(
-    current_user_email = Depends(verify_user_token),
+    current_user_email=Depends(verify_user_token),
     db: Session = Depends(get_db),
 ):
     try:
-
         current_user = db.query(User).filter(User.email == current_user_email).first()
+        if not current_user:
+            raise HTTPException(status_code=404, detail="User not found")
 
         all_groups = db.query(Group).all()
-
         my_groups = []
 
-        for group in list(all_groups):
-            if (current_user.id in group.user_ids):
-                my_groups.append(group)
+        for group in all_groups:
+            if not group.user_ids:
+                continue
+            if current_user.id in group.user_ids:
+                users = db.query(User).filter(User.id.in_(group.user_ids)).all()
+                my_groups.append(
+                    {
+                        "id": group.id,
+                        "name": group.name,
+                        "users": [serialize_user(user) for user in users],
+                    }
+                )
 
         return my_groups
- 
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
 
 
+@router.put("/groups/{group_id}")
+def update_group(
+    group_id: int,
+    data: UpdateGroup,
+    db: Session = Depends(get_db),
+):
+    try:
+        # 1. Find the existing group
+        db_group = db.query(Group).filter(Group.id == group_id).first()
+        if not db_group:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        # 2. Update the fields if provided
+        if data.name is not None:
+            db_group.name = data.name
+        if data.user_ids is not None:
+            db_group.user_ids = data.user_ids
+
+        db.commit()
+        db.refresh(db_group)
+
+        return {"message": "Group updated successfully", "group": db_group}
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+@router.delete("/groups/{group_id}")
+def delete_group(
+    group_id: int,
+    db: Session = Depends(get_db),
+):
+    try:
+        # 1. Find the group
+        db_group = db.query(Group).filter(Group.id == group_id).first()
+        if not db_group:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        # 2. Find all expenses in this group
+        group_expenses = db.query(Expense).filter(Expense.group_id == group_id).all()
+        expense_ids = [e.id for e in group_expenses]
+
+        # 3. Delete all ExpenseUser records for those expenses
+        if expense_ids:
+            db.query(ExpenseUser).filter(
+                ExpenseUser.expense_id.in_(expense_ids)
+            ).delete(synchronize_session=False)
+
+        # 4. Delete all expenses in the group
+        db.query(Expense).filter(Expense.group_id == group_id).delete(
+            synchronize_session=False
+        )
+
+        # 5. Delete the group itself
+        db.delete(db_group)
+        db.commit()
+
+        return {"message": "Group deleted successfully", "group_id": group_id}
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+@router.get("/get_expenses_by_group/{group_id}")
+def get_group_summary(
+    group_id: int,
+    current_user_email=Depends(verify_user_token),
+    db: Session = Depends(get_db),
+):
+    try:
+        # 1. Fetch Current User
+        current_user = db.query(User).filter(User.email == current_user_email).first()
+        if not current_user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # 2. Fetch all expenses in this group
+        group_expenses = db.query(Expense).filter(Expense.group_id == group_id).all()
+        expense_ids = [e.id for e in group_expenses]
+
+        # 3. Calculate Group-Wide Net Balances (Who is up or down in the whole group)
+        # We need this to run the get_payments algorithm
+        all_associations = (
+            db.query(
+                User.id.label("user_id"),
+                User.username.label("user_name"),
+                func.sum(ExpenseUser.paid_amount - ExpenseUser.owed_amount).label(
+                    "net"
+                ),
+            )
+            .join(ExpenseUser, User.id == ExpenseUser.user_id)
+            .filter(ExpenseUser.expense_id.in_(expense_ids))
+            .group_by(User.id, User.username)
+            .all()
+        )
+
+        # Convert query results to list of dicts for our algorithm
+        details = [
+            {"user_id": row.user_id, "user_name": row.user_name, "net": float(row.net)}
+            for row in all_associations
+        ]
+
+        # 4. Get all settlements for the entire group
+        all_settlements = get_payments([d.copy() for d in details])
+
+        # Map ids to usernames for nicer response payloads
+        user_map = {d["user_id"]: d["user_name"] for d in details}
+
+        # 5. Filter settlements specifically for the current user
+        # (Who they owe and who owes them)
+        my_settlements = [
+            {
+                "from": {
+                    "user_id": s["from"],
+                    "username": user_map.get(s["from"], s["from"]),
+                },
+                "to": {"user_id": s["to"], "username": user_map.get(s["to"], s["to"])},
+                "amount": s["amount"],
+            }
+            for s in all_settlements
+            if s["from"] == current_user.id or s["to"] == current_user.id
+        ]
+
+        # 6. Calculate total "You are owed" and "You owe"
+        user_net_row = next(
+            (d for d in details if d["user_id"] == current_user.id), None
+        )
+        user_net_balance = user_net_row["net"] if user_net_row else 0
+
+        return {
+            "group_name": db.query(Group).filter(Group.id == group_id).first().name,
+            "total_expenses_count": len(group_expenses),
+            "user_net_balance": round(
+                user_net_balance, 2
+            ),  # Positive = People owe you, Negative = You owe
+            "my_settlements": my_settlements,  # List of exactly who to pay/take from
+            "all_group_expenses": group_expenses,  # For the list view in FE
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
 
 @router.post("/create_expense")
-def create_expense(data: ExpenseCreate, current_user_email = Depends(verify_user_token), db: Session = Depends(get_db)):
+def create_expense(
+    data: ExpenseCreate,
+    current_user_email=Depends(verify_user_token),
+    db: Session = Depends(get_db),
+):
     try:
         current_user = db.query(User).filter(User.email == current_user_email).first()
 
@@ -97,7 +307,7 @@ def create_expense(data: ExpenseCreate, current_user_email = Depends(verify_user
             description=data.description,
             total_amount=data.total_amount,
             group_id=data.group_id,
-            created_by = current_user.id
+            created_by=current_user.id,
         )
         db.add(new_expense)
         db.flush()  # Gets the new_expense.id

@@ -75,7 +75,7 @@ def register_user(login_data: LoginUser, db: Session = Depends(get_db)):
 
         if not correct_password:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Incorrect Username or password",
             )
         jwt_token = create_access_token(data={"sub": check_user.email})
